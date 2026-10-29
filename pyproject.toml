@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "qgis_geonode"
-version = "2.1.0"
+version = "2.2.0-alpha"
 description = "A QGIS plugin for integrating with modern GeoNode"
 authors = ["GeoNode Development Team <info@geosolutionsgroup.com>"]
 license = "GPL-3.0-or-later"
@@ -38,7 +38,7 @@ exclude = """\
 name = "QGIS GeoNode"
 qgisMinimumVersion = "3.34"
 icon = "plugin-logo.png"
-experimental = "False"
+experimental = "True"
 deprecated = "False"
 homepage = "https://geonode.org/QGISGeoNodePlugin"
 tracker = "https://github.com/GeoNode/QGISGeoNodePlugin/issues"
