@@ -6,6 +6,8 @@ on:
 
 jobs:
   create-release:
+    permissions:
+      contents: write
     runs-on: ubuntu-22.04
     container:
       image: qgis/qgis:final-3_34_12
