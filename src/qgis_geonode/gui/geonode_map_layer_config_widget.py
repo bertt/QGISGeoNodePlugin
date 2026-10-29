@@ -1,4 +1,3 @@
-import json
 import typing
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -16,24 +15,31 @@ from qgis.PyQt import (
 )
 from qgis.PyQt.uic import loadUiType
 
-from ..tasks import network_task
-
 from .. import (
     conf,
-    network,
     styles,
     utils,
 )
 from ..apiclient import (
     base,
     get_geonode_client,
+    is_api_client_supported,
     models,
     has_metadata_api,
+    probe_api_client,
     SUPPORTED_API_CLIENT,
+)
+from ..httpclient import (
+    HttpMethod,
+    NetworkError,
+    NetworkResponse,
+    Request,
+    RequestToPerform,
 )
 from ..metadata import populate_metadata
 from ..utils import (
     log,
+    tr,
 )
 
 WidgetUi, _ = loadUiType(Path(__file__).parents[1] / "ui/qgis_geonode_layer_dialog.ui")
@@ -47,6 +53,7 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
     download_metadata_pb: QtWidgets.QPushButton
     upload_metadata_pb: QtWidgets.QPushButton
     links_gb: qgis.gui.QgsCollapsibleGroupBox
+    source_connection_la: QtWidgets.QLabel
     open_detail_url_pb: QtWidgets.QPushButton
     open_link_url_pb: QtWidgets.QPushButton
     upload_gb: qgis.gui.QgsCollapsibleGroupBox
@@ -55,23 +62,32 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
     upload_layer_pb: QtWidgets.QPushButton
     message_bar: qgis.gui.QgsMessageBar
 
-    network_task: typing.Optional[network_task.NetworkRequestTask]
     _apply_geonode_style: bool
     _apply_geonode_metadata: bool
     _layer_upload_api_client: typing.Optional[base.BaseGeonodeClient]
     _api_client: typing.Optional[base.BaseGeonodeClient]
+    _download_style_request: typing.Optional[Request]
+    _upload_style_request: typing.Optional[Request]
+    _upload_metadata_request: typing.Optional[Request]
 
     @property
     def connection_settings(self) -> typing.Optional[conf.ConnectionSettings]:
+        """Settings of the connection this layer was loaded from, if any."""
         connection_settings_id = self.layer.customProperty(
             models.DATASET_CONNECTION_CUSTOM_PROPERTY_KEY
         )
+        result = None
         if connection_settings_id is not None:
-            result = conf.settings_manager.get_connection_settings(
-                UUID(connection_settings_id)
-            )
-        else:
-            result = None
+            # the id is looked up among the saved connections rather than
+            # handed straight to the settings manager: for a connection that
+            # has been deleted meanwhile, the latter reports a
+            # ConnectionSettings with empty name and base_url instead of
+            # signalling that it is gone
+            stored_id = UUID(connection_settings_id)
+            for connection_settings in conf.settings_manager.list_connections():
+                if connection_settings.id == stored_id:
+                    result = connection_settings
+                    break
         return result
 
     def __init__(self, layer, canvas, parent):
@@ -89,11 +105,13 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
         )
         self.message_bar = qgis.gui.QgsMessageBar()
         self.message_bar.setSizePolicy(
-            QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Fixed
+            QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Fixed
         )
         self.layout().insertWidget(0, self.message_bar)
         self.public_access_chb.setChecked(True)
-        self.network_task = None
+        self._download_style_request = None
+        self._upload_style_request = None
+        self._upload_metadata_request = None
         self._apply_geonode_style = False
         self._apply_geonode_metadata = False
         self.layer = layer
@@ -102,13 +120,29 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
             self._api_client = get_geonode_client(self.connection_settings)
         else:
             self._api_client = None
-        self.upload_layer_pb.clicked.connect(self.upload_layer_to_geonode)
-        suitable_connections = self._get_suitable_upload_connections()
-        if len(suitable_connections) > 0:
-            self._populate_geonode_connection_combo_box(suitable_connections)
-            self._toggle_upload_controls(enabled=True)
+        self._connection_probes: typing.List[Request] = []
+        self._layer_came_from_geonode = (
+            self.layer.customProperty(models.DATASET_CONNECTION_CUSTOM_PROPERTY_KEY)
+            is not None
+        )
+        if self._layer_came_from_geonode:
+            # This layer belongs to the GeoNode it was loaded from, so there is
+            # no upload target to choose: offering the other connections would
+            # let a user holding credentials for several of them push changes
+            # to the wrong server. The upload group box goes away entirely and
+            # the GeoNode source group states which GeoNode the layer is bound
+            # to instead
+            self._show_source_connection()
+            self.upload_gb.setVisible(False)
         else:
-            self._toggle_upload_controls(enabled=False)
+            self.source_connection_la.setVisible(False)
+            self.upload_layer_pb.clicked.connect(self.upload_layer_to_geonode)
+            self._refresh_upload_connections()
+        # the style and metadata controls need this layer's own api client,
+        # and the api-support cache (5-min TTL) is otherwise only warmed by
+        # the Data Source Manager's GeoNode tab
+        if self._layer_came_from_geonode:
+            self._probe_origin_connection()
         self._toggle_style_controls(enabled=False)
         self._toggle_link_controls(enabled=False)
         self._toggle_metadata_controls(enabled=False)
@@ -120,9 +154,12 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
             self.open_link_url_pb.clicked.connect(self.open_link_url)
             self.download_metadata_pb.clicked.connect(self.download_metadata)
             self.upload_metadata_pb.clicked.connect(self.upload_metadata)
-            self._toggle_style_controls(enabled=True)
             self._toggle_link_controls(enabled=True)
-            self._toggle_metadata_controls(enabled=True)
+            # Style and metadata toggles dereference ``self._api_client``;
+            # only enable them when the api client is actually resolved.
+            # When the cache was cold at init, the probe handler will
+            # re-toggle these once the api client has been refreshed.
+            self._toggle_geonode_layer_controls()
         else:  # this is not a GeoNode layer
             pass
 
@@ -151,65 +188,71 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
 
     def download_style(self):
         dataset = self.get_dataset()
-        self.network_task = network_task.NetworkRequestTask(
-            [network.RequestToPerform(QtCore.QUrl(dataset.default_style.sld_url))],
-            self._api_client.network_requests_timeout,
-            self.connection_settings.auth_config,
-            description="Get dataset style",
-        )
-        self.network_task.task_done.connect(self.handle_style_downloaded)
+        self._download_style_request = Request(parent=self)
+        self._download_style_request.finished.connect(self.handle_style_downloaded)
         self._toggle_style_controls(enabled=False)
-        self._show_message(message="Retrieving style...", add_loading_widget=True)
-        qgis.core.QgsApplication.taskManager().addTask(self.network_task)
+        self._show_message(
+            message="Retrieving style...",
+            add_loading_widget=True,
+            cancel_callback=self._download_style_request.cancel,
+        )
+        self._download_style_request.send(
+            RequestToPerform(url=QtCore.QUrl(dataset.default_style.sld_url)),
+            authcfg=self.connection_settings.auth_config,
+            timeout_ms=self._api_client.network_requests_timeout,
+        )
 
-    def handle_style_downloaded(self, task_result: bool):
+    def handle_style_downloaded(self, response: NetworkResponse):
         self._toggle_style_controls(enabled=True)
-        if task_result:
-            sld_named_layer, error_message = styles.get_usable_sld(
-                self.network_task.response_contents[0]
-            )
-            if sld_named_layer is not None:
-                dataset = self.get_dataset()
-                dataset.default_style.sld = sld_named_layer
-                self.update_dataset(dataset)
-                self._apply_geonode_style = True
-                self.apply()
-            else:
-                self._show_message(
-                    message=(
-                        f"Unable to download and parse SLD style from remote "
-                        f"GeoNode: {error_message}"
-                    ),
-                    level=qgis.core.Qgis.Warning,
-                )
-        else:
+        if not response.ok:
             self._show_message(
-                "Unable to retrieve GeoNode style", level=qgis.core.Qgis.Warning
+                f"Unable to retrieve GeoNode style: {response.error.message}",
+                level=qgis.core.Qgis.Warning,
             )
+            return
+        sld_named_layer, error_message = styles.deserialize_sld_doc(
+            QtCore.QByteArray(response.body)
+        )
+        if sld_named_layer is None:
+            self._show_message(
+                message=(
+                    f"Unable to download and parse SLD style from remote "
+                    f"GeoNode: {error_message}"
+                ),
+                level=qgis.core.Qgis.Warning,
+            )
+            return
+        dataset = self.get_dataset()
+        dataset.default_style.sld = sld_named_layer
+        self.update_dataset(dataset)
+        self._apply_geonode_style = True
+        self.apply()
 
     def upload_style(self):
         self.apply()
         sld_data = self._prepare_style_for_upload()
-        if sld_data is not None:
-            serialized_sld, content_type = sld_data
-            dataset = self.get_dataset()
-            self.network_task = network_task.NetworkRequestTask(
-                [
-                    network.RequestToPerform(
-                        QtCore.QUrl(dataset.default_style.sld_url),
-                        method=network.HttpMethod.PUT,
-                        payload=serialized_sld,
-                        content_type=content_type,
-                    )
-                ],
-                self._api_client.network_requests_timeout,
-                self.connection_settings.auth_config,
-                description="Upload dataset style to GeoNode",
-            )
-            self.network_task.task_done.connect(self.handle_style_uploaded)
-            self._toggle_style_controls(enabled=False)
-            self._show_message(message="Uploading style...", add_loading_widget=True)
-            qgis.core.QgsApplication.taskManager().addTask(self.network_task)
+        if sld_data is None:
+            return
+        serialized_sld, content_type = sld_data
+        dataset = self.get_dataset()
+        self._upload_style_request = Request(parent=self)
+        self._upload_style_request.finished.connect(self.handle_style_uploaded)
+        self._toggle_style_controls(enabled=False)
+        self._show_message(
+            message="Uploading style...",
+            add_loading_widget=True,
+            cancel_callback=self._upload_style_request.cancel,
+        )
+        self._upload_style_request.send(
+            RequestToPerform(
+                url=QtCore.QUrl(dataset.default_style.sld_url),
+                method=HttpMethod.PUT,
+                payload=serialized_sld,
+                content_type=content_type,
+            ),
+            authcfg=self.connection_settings.auth_config,
+            timeout_ms=self._api_client.network_requests_timeout,
+        )
 
     def _prepare_style_for_upload(self) -> typing.Optional[typing.Tuple[str, str]]:
         doc = QtXml.QDomDocument()
@@ -270,27 +313,27 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
         content_type = "application/vnd.ogc.sld+xml"
         return new_serialized, content_type
 
-    def handle_style_uploaded(self, task_result: bool) -> None:
+    def handle_style_uploaded(self, response: NetworkResponse) -> None:
         self._toggle_style_controls(enabled=True)
-        if task_result:
-            parsed_reply = self.network_task.response_contents[0]
-            if parsed_reply is not None:
-                if parsed_reply.http_status_code == 200:
-                    self._show_message("Style uploaded successfully!")
-                else:
-                    error_message_parts = [
-                        "Could not upload style",
-                        parsed_reply.qt_error,
-                        f"HTTP {parsed_reply.http_status_code}",
-                        parsed_reply.http_status_reason,
-                    ]
-                    error_message = " - ".join(i for i in error_message_parts if i)
-                    self._show_message(error_message, level=qgis.core.Qgis.Warning)
-        else:
-            self._show_message(
-                f"Could not upload style",
-                level=qgis.core.Qgis.Warning,
-            )
+        if response.ok and response.http_status == 200:
+            self._show_message("Style uploaded successfully!")
+            return
+        err = response.error
+        error_message_parts = ["Could not upload style"]
+        if err is not None:
+            if err.qt_error:
+                error_message_parts.append(err.qt_error)
+            if err.http_status is not None:
+                error_message_parts.append(f"HTTP {err.http_status}")
+            error_message_parts.append(err.message)
+        elif response.http_status is not None:
+            error_message_parts.append(f"HTTP {response.http_status}")
+            if response.http_reason:
+                error_message_parts.append(response.http_reason)
+        self._show_message(
+            " - ".join(p for p in error_message_parts if p),
+            level=qgis.core.Qgis.Warning,
+        )
 
     def download_metadata(self) -> None:
         """Initiate download of metadata from the remote GeoNode"""
@@ -335,53 +378,49 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
             else dataset_link
         )
 
-        self.network_task = network_task.NetworkRequestTask(
-            [
-                network.RequestToPerform(
-                    QtCore.QUrl(metadata_link),
-                    method=network.HttpMethod.PATCH,
-                    payload=json.dumps(
-                        {
-                            "title": current_metadata.title(),
-                            "abstract": current_metadata.abstract(),
-                        }
-                    ),
-                    content_type="application/json",
-                )
-            ],
-            self._api_client.network_requests_timeout,
-            self._api_client.auth_config,
-            description="Upload metadata",
-        )
-        self.network_task.task_done.connect(self.handle_metadata_uploaded)
+        self._upload_metadata_request = Request(parent=self)
+        self._upload_metadata_request.finished.connect(self.handle_metadata_uploaded)
         self._toggle_metadata_controls(enabled=False)
-        self._show_message(message="Uploading metadata...", add_loading_widget=True)
-        qgis.core.QgsApplication.taskManager().addTask(self.network_task)
+        self._show_message(
+            message="Uploading metadata...",
+            add_loading_widget=True,
+            cancel_callback=self._upload_metadata_request.cancel,
+        )
+        self._upload_metadata_request.send(
+            RequestToPerform(
+                url=QtCore.QUrl(metadata_link),
+                method=HttpMethod.PATCH,
+                payload={
+                    "title": current_metadata.title(),
+                    "abstract": current_metadata.abstract(),
+                },
+                content_type="application/json",
+            ),
+            authcfg=self._api_client.auth_config,
+            timeout_ms=self._api_client.network_requests_timeout,
+        )
 
-    def handle_metadata_uploaded(self, task_result: bool) -> None:
+    def handle_metadata_uploaded(self, response: NetworkResponse) -> None:
         self._toggle_metadata_controls(enabled=True)
-        if task_result:
-            parsed_reply = self.network_task.response_contents[0]
-            if parsed_reply is not None:
-                if parsed_reply.http_status_code == 200:
-                    self._show_message("Metadata uploaded successfully!")
-                else:
-                    error_message_parts = [
-                        "Could not upload metadata",
-                        parsed_reply.qt_error,
-                        f"HTTP {parsed_reply.http_status_code}",
-                        parsed_reply.http_status_reason,
-                    ]
-                    error_message = " - ".join(i for i in error_message_parts if i)
-                    self._show_message(error_message, level=qgis.core.Qgis.Warning)
-            else:
-                self._show_message(
-                    "Could not upload metadata", level=qgis.core.Qgis.Warning
-                )
-        else:
-            self._show_message(
-                "Could not upload metadata", level=qgis.core.Qgis.Warning
-            )
+        if response.ok and response.http_status == 200:
+            self._show_message("Metadata uploaded successfully!")
+            return
+        err = response.error
+        error_message_parts = ["Could not upload metadata"]
+        if err is not None:
+            if err.qt_error:
+                error_message_parts.append(err.qt_error)
+            if err.http_status is not None:
+                error_message_parts.append(f"HTTP {err.http_status}")
+            error_message_parts.append(err.message)
+        elif response.http_status is not None:
+            error_message_parts.append(f"HTTP {response.http_status}")
+            if response.http_reason:
+                error_message_parts.append(response.http_reason)
+        self._show_message(
+            " - ".join(p for p in error_message_parts if p),
+            level=qgis.core.Qgis.Warning,
+        )
 
     def open_detail_url(self) -> None:
         dataset = self.get_dataset()
@@ -392,14 +431,54 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(dataset.link))
 
     def upload_layer_to_geonode(self) -> None:
-        self._toggle_upload_controls(enabled=False)
-        self._show_message("Uploading layer to GeoNode...", add_loading_widget=True)
         connection_settings: conf.ConnectionSettings = (
             self.geonode_connection_cb.currentData()
         )
+        if connection_settings is None:
+            return
+        self._toggle_upload_controls(enabled=False)
+        if is_api_client_supported(connection_settings.base_url):
+            self._start_upload(connection_settings)
+            return
+        # nothing has contacted this GeoNode yet - the upload is the first
+        # thing that actually needs it, so probe it now
+        self._show_message("Contacting GeoNode...", add_loading_widget=True)
+        probe = probe_api_client(
+            connection_settings.base_url,
+            auth_config=connection_settings.auth_config,
+            timeout_ms=connection_settings.network_requests_timeout,
+            parent=self,
+        )
+        probe.finished.connect(
+            lambda _response, settings=connection_settings: self._start_upload(settings)
+        )
+        self._connection_probes.append(probe)
+
+    def _start_upload(self, connection_settings: conf.ConnectionSettings) -> None:
         self._layer_upload_api_client = get_geonode_client(connection_settings)
+        if self._layer_upload_api_client is None:
+            self._toggle_upload_controls(enabled=True)
+            self._show_message(
+                f"{connection_settings.name} is not a GeoNode this plugin can "
+                f"upload to",
+                level=qgis.core.Qgis.Critical,
+            )
+            return
+        if not self._supports_uploading_this_layer(self._layer_upload_api_client):
+            self._layer_upload_api_client = None
+            self._toggle_upload_controls(enabled=True)
+            self._show_message(
+                f"{connection_settings.name} does not accept uploads of this "
+                f"layer type",
+                level=qgis.core.Qgis.Critical,
+            )
+            return
+        self._show_message("Uploading layer to GeoNode...", add_loading_widget=True)
         self._layer_upload_api_client.dataset_uploaded.connect(
             self.handle_layer_uploaded
+        )
+        self._layer_upload_api_client.dataset_upload_processing.connect(
+            self.handle_layer_upload_processing
         )
         self._layer_upload_api_client.dataset_upload_error_received.connect(
             self.handle_layer_upload_error
@@ -408,37 +487,123 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
             self.layer, allow_public_access=self.public_access_chb.isChecked()
         )
 
+    def handle_layer_upload_processing(self):
+        # POST is done; the server is now ingesting asynchronously. Keep the
+        # spinner and the controls disabled, just swap the message.
+        self._show_message(
+            "Upload received. GeoNode is processing the dataset...",
+            add_loading_widget=True,
+        )
+
     def handle_layer_uploaded(self):
         self._toggle_upload_controls(enabled=True)
         self._show_message("Layer uploaded successfully!")
 
-    def handle_layer_upload_error(self, *args):
+    def handle_layer_upload_error(self, error: NetworkError):
         self._toggle_upload_controls(enabled=True)
+        fragments = [error.qt_error or None]
+        if error.http_status is not None:
+            fragments.append(f"HTTP {error.http_status}")
+        fragments.append(error.message)
         self._show_message(
-            " - ".join(str(i) for i in args), level=qgis.core.Qgis.Critical
+            " - ".join(f for f in fragments if f),
+            level=qgis.core.Qgis.Critical,
         )
         self._layer_upload_api_client = None
 
-    def _get_suitable_upload_connections(self) -> typing.List[conf.ConnectionSettings]:
-        result = []
-        for connection_settings in conf.settings_manager.list_connections():
-            client: typing.Optional[base.BaseGeonodeClient] = get_geonode_client(
-                connection_settings
-            )
-            if client is not None:
-                target_capability = {
-                    qgis.core.QgsMapLayerType.VectorLayer: models.ApiClientCapability.UPLOAD_VECTOR_LAYER,
-                    qgis.core.QgsMapLayerType.RasterLayer: models.ApiClientCapability.UPLOAD_RASTER_LAYER,
-                }[self.layer.type()]
-                if target_capability in client.capabilities:
-                    result.append(connection_settings)
-        return result
+    def _supports_uploading_this_layer(self, client: base.BaseGeonodeClient) -> bool:
+        target_capability = {
+            qgis.core.QgsMapLayerType.VectorLayer: models.ApiClientCapability.UPLOAD_VECTOR_LAYER,
+            qgis.core.QgsMapLayerType.RasterLayer: models.ApiClientCapability.UPLOAD_RASTER_LAYER,
+        }[self.layer.type()]
+        return target_capability in client.capabilities
 
     def _populate_geonode_connection_combo_box(
-        self, suitable_connections: typing.List[conf.ConnectionSettings]
+        self, connections: typing.List[conf.ConnectionSettings]
     ) -> None:
-        for connection in suitable_connections:
+        previous = self.geonode_connection_cb.currentData()
+        self.geonode_connection_cb.clear()
+        for connection in connections:
             self.geonode_connection_cb.addItem(connection.name, connection)
+        if previous is not None:
+            for index in range(self.geonode_connection_cb.count()):
+                if self.geonode_connection_cb.itemData(index).id == previous.id:
+                    self.geonode_connection_cb.setCurrentIndex(index)
+                    break
+
+    def _show_source_connection(self) -> None:
+        """State which GeoNode this layer comes from.
+
+        Nothing else in the dialog names it, since the connection combo box
+        lives in the upload group box, which is hidden for these layers.
+        """
+
+        origin = self.connection_settings
+        if origin is not None:
+            described_connection = f"<b>{origin.name}</b> ({origin.base_url})"
+        else:
+            # the connection was deleted after the layer had been loaded from
+            # it, so all that is left of its origin is the id kept in the
+            # layer's custom property
+            stored_id = self.layer.customProperty(
+                models.DATASET_CONNECTION_CUSTOM_PROPERTY_KEY
+            )
+            described_connection = tr(
+                "a GeoNode connection that no longer exists (id {})"
+            ).format(stored_id)
+        self.source_connection_la.setText(
+            tr("This layer comes from {}").format(described_connection)
+        )
+
+    def _probe_origin_connection(self) -> None:
+        """Probe the connection this layer came from, if its cache entry is cold.
+
+        Only that one: probing every saved connection here would hit each
+        registered GeoNode on every opening of the dialog.
+        """
+
+        origin = self.connection_settings
+        if origin is None or is_api_client_supported(origin.base_url):
+            return
+        probe = probe_api_client(
+            origin.base_url,
+            auth_config=origin.auth_config,
+            timeout_ms=origin.network_requests_timeout,
+            parent=self,
+        )
+        probe.finished.connect(self._handle_origin_probe_finished)
+        self._connection_probes.append(probe)
+
+    def _handle_origin_probe_finished(self, _response: NetworkResponse) -> None:
+        # Style/metadata controls of GeoNode-imported layers depend on
+        # ``self._api_client`` (its ``capabilities`` list). If init left it
+        # as ``None`` because the cache was cold, refresh it now that the
+        # probe has landed and re-toggle.
+        if (
+            self._api_client is None
+            and self.connection_settings is not None
+            and self.layer.customProperty(models.DATASET_CUSTOM_PROPERTY_KEY)
+            is not None
+        ):
+            self._api_client = get_geonode_client(self.connection_settings)
+            self._toggle_geonode_layer_controls()
+
+    def _refresh_upload_connections(self) -> None:
+        """Offer the saved connections as upload targets.
+
+        Whether one of them really is a usable GeoNode is settled when the
+        user uploads - see :meth:`upload_layer_to_geonode` - so that opening
+        this dialog costs no requests.
+        """
+
+        connections = conf.settings_manager.list_connections()
+        self._populate_geonode_connection_combo_box(connections)
+        self._toggle_upload_controls(enabled=len(connections) > 0)
+
+    def _toggle_geonode_layer_controls(self) -> None:
+        ready = self._api_client is not None
+        self._toggle_style_controls(enabled=ready)
+        self._toggle_metadata_controls(enabled=ready)
 
     def _apply_sld(self) -> None:
         dataset = self.get_dataset()
@@ -459,8 +624,15 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
         message: str,
         level: typing.Optional[qgis.core.Qgis.MessageLevel] = qgis.core.Qgis.Info,
         add_loading_widget: bool = False,
+        cancel_callback: typing.Optional[typing.Callable[[], None]] = None,
     ) -> None:
-        utils.show_message(self.message_bar, message, level, add_loading_widget)
+        utils.show_message(
+            self.message_bar,
+            message,
+            level,
+            add_loading_widget,
+            cancel_callback=cancel_callback,
+        )
 
     def find_parent_by_type(self, obj, target_type):
         # Find the desired object by type
@@ -491,7 +663,12 @@ class GeonodeMapLayerConfigWidget(qgis.gui.QgsMapLayerConfigWidget, WidgetUi):
             )
 
     def _toggle_link_controls(self, enabled: bool) -> None:
-        self.links_gb.setEnabled(enabled)
+        # the group box holds the source text too, so it stays enabled for a
+        # layer that came from a GeoNode even when the dataset details it
+        # links to could not be fetched - only the buttons follow ``enabled``
+        self.links_gb.setEnabled(enabled or self._layer_came_from_geonode)
+        for widget in (self.open_detail_url_pb, self.open_link_url_pb):
+            widget.setEnabled(enabled)
 
     def _toggle_style_controls(self, enabled: bool) -> None:
         widgets = []

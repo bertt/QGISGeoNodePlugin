@@ -15,7 +15,6 @@ from qgis.core import QgsRectangle, QgsSettings
 
 from .apiclient import models
 from .apiclient.models import GeonodeResourceType, IsoTopicCategory
-from .network import UNSUPPORTED_REMOTE
 from .utils import log
 from packaging import version as packaging_version
 
@@ -239,7 +238,8 @@ class SettingsManager(QtCore.QObject):
                 )
                 if filter_value is not None:
                     settings.setValue(
-                        temporal_filter_name, filter_value.toString(QtCore.Qt.ISODate)
+                        temporal_filter_name,
+                        filter_value.toString(QtCore.Qt.DateFormat.ISODate),
                     )
                 else:
                     settings.setValue(temporal_filter_name, None)
@@ -284,7 +284,9 @@ class SettingsManager(QtCore.QObject):
                     setattr(
                         result,
                         temporal_filter_name,
-                        QtCore.QDateTime.fromString(value, QtCore.Qt.ISODate),
+                        QtCore.QDateTime.fromString(
+                            value, QtCore.Qt.DateFormat.ISODate
+                        ),
                     )
 
             if settings.value("spatial_extent_north") is not None:

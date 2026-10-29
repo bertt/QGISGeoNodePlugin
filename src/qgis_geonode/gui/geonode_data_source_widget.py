@@ -11,13 +11,15 @@ from qgis.PyQt import (
 from qgis.PyQt.uic import loadUiType
 from qgis.utils import iface
 
-from ..tasks import network_task
-
 from ..apiclient import (
     base,
     get_geonode_client,
     models,
+    ApiSupport,
+    api_client_support,
+    api_support_check,
     is_api_client_supported,
+    probe_api_client,
 )
 from .. import (
     conf,
@@ -26,7 +28,7 @@ from .. import (
 from ..apiclient.models import ApiClientCapability, IsoTopicCategory
 from ..gui.connection_dialog import ConnectionDialog
 from ..gui.search_result_widget import SearchResultWidget
-from .. import network
+from ..httpclient import NetworkError, Request
 from ..utils import (
     tr,
 )
@@ -42,7 +44,7 @@ _INVALID_CONNECTION_MESSAGE = (
 class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
     advanced_search_gb: qgis.gui.QgsCollapsibleGroupBox
     api_client: typing.Optional[base.BaseGeonodeClient] = None
-    discovery_task: typing.Optional[network_task.NetworkRequestTask]
+    discovery_task: typing.Optional[Request]
     abstract_la: QtWidgets.QLabel
     abstract_le: QtWidgets.QLineEdit
     category_la: QtWidgets.QLabel
@@ -102,11 +104,11 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
         self.grid_layout = QtWidgets.QGridLayout()
         self.message_bar = qgis.gui.QgsMessageBar()
         self.message_bar.setSizePolicy(
-            QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Fixed
+            QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Fixed
         )
         self.grid_layout.addWidget(self.scroll_area, 0, 0, 1, 1)
         self.grid_layout.addWidget(
-            self.message_bar, 0, 0, 1, 1, alignment=QtCore.Qt.AlignTop
+            self.message_bar, 0, 0, 1, 1, alignment=QtCore.Qt.AlignmentFlag.AlignTop
         )
         self.layout().insertLayout(4, self.grid_layout)
 
@@ -203,7 +205,9 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
         self._hide_core_geonode_provider()
 
         # Plugin's docs open through the help button
-        self.buttonBox.button(QtWidgets.QDialogButtonBox.Help).clicked.connect(
+        self.buttonBox.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Help
+        ).clicked.connect(
             lambda: QtGui.QDesktopServices.openUrl(
                 QtCore.QUrl(plugin_metadata.get("homepage"))
             )
@@ -236,7 +240,7 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
                 conf.settings_manager.get_current_connection_settings()
             )
             dialog = ConnectionDialog(connection_settings=connection_settings)
-        dialog.exec_()
+        dialog.exec()
         self.update_connections_combobox()
 
     def delete_connection_configuration(self):
@@ -313,24 +317,40 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
 
         conf.settings_manager.set_current_connection(current_connection.id)
 
-        # Check if API v2 is supported
-        api_supported = is_api_client_supported(current_connection.base_url)
-
-        if not api_supported:
+        if is_api_client_supported(current_connection.base_url):
+            self._apply_active_connection(current_connection)
+        else:
+            # Cache cold (or known-not-supported); probe and apply on completion.
+            self.api_client = None
+            self.toggle_search_buttons(enable=False)
+            self.discover_api_client(self._apply_active_connection, current_connection)
             self.show_message(
-                tr(_INVALID_CONNECTION_MESSAGE), level=qgis.core.Qgis.Critical
+                tr("Checking connection..."),
+                add_loading_widget=True,
+                cancel_callback=self.discovery_task.cancel,
             )
+
+    def _apply_active_connection(
+        self, current_connection: conf.ConnectionSettings
+    ) -> None:
+        self.message_bar.clearWidgets()
+        support = api_client_support(current_connection.base_url)
+        if support is not ApiSupport.SUPPORTED:
+            if support is ApiSupport.UNSUPPORTED:
+                # reviewing the connection settings won't help here
+                message = api_support_check().unsupported_message()
+            else:
+                message = tr(_INVALID_CONNECTION_MESSAGE)
+            self.show_message(message, level=qgis.core.Qgis.Critical)
             self.api_client = None
             self.toggle_search_buttons(enable=False)
         else:
-            # API is reachable so instantiate client
             self.api_client = get_geonode_client(current_connection)
             if self.api_client:
                 self._load_sorting_fields()
                 self.api_client.dataset_list_received.connect(self.handle_dataset_list)
                 self.api_client.search_error_received.connect(self.handle_search_error)
             self.toggle_search_buttons(enable=True)
-
         self.update_gui(current_connection)
 
     def toggle_search_buttons(self, enable: typing.Optional[bool] = None):
@@ -423,19 +443,24 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
             self,
             tr("QGIS GeoNode"),
             message,
-            QtWidgets.QMessageBox.Yes,
-            QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+            QtWidgets.QMessageBox.StandardButton.No,
         )
-        return confirmation == QtWidgets.QMessageBox.Yes
+        return confirmation == QtWidgets.QMessageBox.StandardButton.Yes
 
     def show_message(
-        self, message: str, level=qgis.core.Qgis.Info, add_loading_widget: bool = False
+        self,
+        message: str,
+        level=qgis.core.Qgis.Info,
+        add_loading_widget: bool = False,
+        cancel_callback: typing.Optional[typing.Callable[[], None]] = None,
     ) -> None:
         utils.show_message(
             self.message_bar,
             message,
             level=level,
             add_loading_widget=add_loading_widget,
+            cancel_callback=cancel_callback,
         )
 
     def request_next_page(self):
@@ -448,29 +473,37 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
 
     def discover_api_client(self, next_: typing.Callable, *next_args, **next_kwargs):
         current_connection = conf.settings_manager.get_current_connection_settings()
-        self.discovery_task = network_task.NetworkRequestTask(
-            [
-                network.RequestToPerform(
-                    QtCore.QUrl(f"{current_connection.base_url}/version.txt")
-                )
-            ],
-            current_connection.network_requests_timeout,
-            current_connection.auth_config,
-            description="Test GeoNode connection",
+        # probe_api_client populates the api-support cache as a side-effect
+        # before the handler below runs, so is_api_client_supported reflects
+        # the probe outcome by the time next_() is invoked.
+        self.discovery_task = probe_api_client(
+            current_connection.base_url,
+            auth_config=current_connection.auth_config,
+            timeout_ms=current_connection.network_requests_timeout,
+            parent=self,
         )
-        self.discovery_task.task_done.connect(
-            partial(self.handle_api_client_discovery, next_, *next_args, **next_kwargs)
+        # A lambda — not partial — is required here. ``finished`` emits one
+        # positional NetworkResponse; ``partial(handler, next_, *next_args)``
+        # would *append* that NetworkResponse after the bound args, which
+        # quietly mis-slots ``response`` as ``next_args[0]`` whenever the
+        # caller passes any positional next_args (e.g.
+        # ``discover_api_client(self._apply_active_connection,
+        # current_connection)``). The lambda explicitly discards the
+        # NetworkResponse — handle_api_client_discovery doesn't need it; the
+        # api-support cache is the source of truth by the time it runs.
+        self.discovery_task.finished.connect(
+            lambda _response: self.handle_api_client_discovery(
+                next_, *next_args, **next_kwargs
+            )
         )
-        qgis.core.QgsApplication.taskManager().addTask(self.discovery_task)
 
     def handle_api_client_discovery(
-        self, next_: typing.Callable, task_result: bool, *next_args, **next_kwargs
+        self,
+        next_: typing.Callable,
+        *next_args,
+        **next_kwargs,
     ):
         current_connection = conf.settings_manager.get_current_connection_settings()
-
-        # task_result should now reflect is_api_client_supported()
-        api_supported = task_result
-
         conf.settings_manager.save_connection_settings(current_connection)
         self.update_connections_combobox()
         next_(*next_args, **next_kwargs)
@@ -489,8 +522,12 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
 
         current_connection = conf.settings_manager.get_current_connection_settings()
 
-        # Check if the API is reachable
-        if not is_api_client_supported(current_connection.base_url):
+        support = api_client_support(current_connection.base_url)
+        if support is ApiSupport.UNSUPPORTED:
+            # settled rejection - discover_api_client would just loop back here
+            self.search_finished.emit(api_support_check().unsupported_message())
+        elif support is not ApiSupport.SUPPORTED:
+            # cache cold or stale
             self.discover_api_client(
                 next_=self.search_geonode, reset_pagination=reset_pagination
             )
@@ -518,20 +555,12 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
         self.toggle_search_buttons()
         self.title_le.setFocus()
 
-    def handle_search_error(
-        self,
-        qt_error_message: str,
-        http_status_code: int = 0,
-        http_status_reason: str = None,
-    ):
-        message_fragments = [
-            "Search ended with error",
-            qt_error_message,
-            f"HTTP {http_status_code}" if http_status_code != 0 else None,
-            http_status_reason,
-        ]
-        error_message = " - ".join(i for i in message_fragments if i)
-        self.search_finished.emit(error_message)
+    def handle_search_error(self, error: NetworkError):
+        fragments = ["Search ended with error", error.qt_error or None]
+        if error.http_status is not None:
+            fragments.append(f"HTTP {error.http_status}")
+        fragments.append(error.message)
+        self.search_finished.emit(" - ".join(f for f in fragments if f))
 
     def handle_dataset_list(
         self,
@@ -559,10 +588,16 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
                     data_source_widget=self,
                 )
                 layout.addWidget(search_result_widget)
-                layout.setAlignment(search_result_widget, QtCore.Qt.AlignTop)
+                layout.setAlignment(
+                    search_result_widget, QtCore.Qt.AlignmentFlag.AlignTop
+                )
             scroll_container.setLayout(layout)
-            self.scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
-            self.scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self.scroll_area.setVerticalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+            )
+            self.scroll_area.setHorizontalScrollBarPolicy(
+                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
             self.scroll_area.setWidgetResizable(True)
             self.scroll_area.setWidget(scroll_container)
             self.message_bar.clearWidgets()
@@ -680,7 +715,9 @@ class GeonodeDataSourceWidget(qgis.gui.QgsAbstractDataSourceWidget, WidgetUi):
             keyword=self.keyword_le.text() or None,
             topic_category=category,
             layer_types=resource_types,
-            ordering_field=self.sort_field_cmb.currentData(QtCore.Qt.UserRole),
+            ordering_field=self.sort_field_cmb.currentData(
+                QtCore.Qt.ItemDataRole.UserRole
+            ),
             reverse_ordering=self.reverse_order_chb.isChecked(),
             temporal_extent_start=temp_ex_start if not temp_ex_start.isNull() else None,
             temporal_extent_end=temp_ex_end if not temp_ex_end.isNull() else None,

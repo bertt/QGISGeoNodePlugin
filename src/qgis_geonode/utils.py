@@ -2,7 +2,7 @@ import typing
 from urllib.parse import urlparse
 
 import qgis.gui
-from PyQt5 import QtCore, QtWidgets
+from qgis.PyQt import QtCore, QtWidgets
 from qgis.core import (
     Qgis,
     QgsMessageLog,
@@ -10,7 +10,7 @@ from qgis.core import (
 
 
 def log(message: typing.Any, name: str = "qgis_geonode", debug: bool = True):
-    level = Qgis.Info if debug else Qgis.Warning
+    level = Qgis.MessageLevel.Info if debug else Qgis.MessageLevel.Warning
     QgsMessageLog.logMessage(str(message), name, level=level)
 
 
@@ -28,15 +28,25 @@ def show_message(
     message: str,
     level: typing.Optional[qgis.core.Qgis.MessageLevel] = qgis.core.Qgis.Info,
     add_loading_widget: bool = False,
+    cancel_callback: typing.Optional[typing.Callable[[], None]] = None,
 ) -> None:
     message_bar.clearWidgets()
     message_item = message_bar.createMessage(message)
     if add_loading_widget:
         progress_bar = QtWidgets.QProgressBar()
-        progress_bar.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        progress_bar.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
         progress_bar.setMinimum(0)
         progress_bar.setMaximum(0)
         message_item.layout().addWidget(progress_bar)
+    if cancel_callback is not None:
+        cancel_button = QtWidgets.QToolButton()
+        cancel_button.setText("✕")
+        cancel_button.setToolTip(tr("Cancel"))
+        cancel_button.setAutoRaise(True)
+        cancel_button.clicked.connect(cancel_callback)
+        message_item.layout().addWidget(cancel_button)
     message_bar.pushWidget(message_item, level=level)
 
 
@@ -58,9 +68,10 @@ def url_from_geoserver(base_url: str, raw_url: str):
         url_path = urlparse(raw_url).path.strip("/")
     except TypeError:
         QgsMessageLog.logMessage(
-            "Incorrect type returned from GeoServer", 
-            "GeoNode", 
-            Qgis.Warning)
+            "Incorrect type returned from GeoServer",
+            "GeoNode",
+            Qgis.MessageLevel.Warning,
+        )
         return None
 
     url_path = url_path.split("/")

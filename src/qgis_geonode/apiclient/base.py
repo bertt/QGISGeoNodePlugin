@@ -7,12 +7,8 @@ from qgis.PyQt import (
     QtXml,
 )
 
-from .. import (
-    conf,
-    network,
-)
-
-from ..tasks import network_task
+from .. import conf
+from ..httpclient import NetworkError, NetworkResponse, Request, RequestToPerform
 from . import models
 from .models import GeonodeApiSearchFilters
 from ..utils import log
@@ -21,7 +17,7 @@ from ..utils import log
 class BaseGeonodeClient(QtCore.QObject):
     auth_config: str
     base_url: str
-    network_fetcher_task: typing.Optional[network_task.NetworkRequestTask]
+    _upload_task: typing.Optional[qgis.core.QgsTask]
     capabilities: typing.List[models.ApiClientCapability]
     page_size: int
     wfs_version: conf.WfsVersion
@@ -29,13 +25,14 @@ class BaseGeonodeClient(QtCore.QObject):
 
     dataset_list_received = QtCore.pyqtSignal(list, models.GeonodePaginationInfo)
     dataset_detail_received = QtCore.pyqtSignal(object)
-    dataset_detail_error_received = QtCore.pyqtSignal([str], [str, int, str])
+    dataset_detail_error_received = QtCore.pyqtSignal(NetworkError)
     style_detail_received = QtCore.pyqtSignal(QtXml.QDomElement)
-    style_detail_error_received = QtCore.pyqtSignal([str], [str, int, str])
+    style_detail_error_received = QtCore.pyqtSignal(NetworkError)
     keyword_list_received = QtCore.pyqtSignal(list)
-    search_error_received = QtCore.pyqtSignal([str], [str, int, str])
+    search_error_received = QtCore.pyqtSignal(NetworkError)
     dataset_uploaded = QtCore.pyqtSignal()
-    dataset_upload_error_received = QtCore.pyqtSignal([str], [str, int, str])
+    dataset_upload_processing = QtCore.pyqtSignal()
+    dataset_upload_error_received = QtCore.pyqtSignal(NetworkError)
 
     def __init__(
         self,
@@ -51,7 +48,11 @@ class BaseGeonodeClient(QtCore.QObject):
         self.page_size = page_size
         self.wfs_version = wfs_version
         self.network_requests_timeout = network_requests_timeout
-        self.network_fetcher_task = None
+        self._upload_task = None
+        self._style_request: typing.Optional[Request] = None
+        self._dataset_list_request: typing.Optional[Request] = None
+        self._dataset_detail_request: typing.Optional[Request] = None
+        self._dataset_detail_from_id_request: typing.Optional[Request] = None
 
     @classmethod
     def from_connection_settings(cls, connection_settings: conf.ConnectionSettings):
@@ -78,45 +79,44 @@ class BaseGeonodeClient(QtCore.QObject):
         raise NotImplementedError
 
     def get_dataset_list(self, search_filters: GeonodeApiSearchFilters) -> None:
-        self.network_fetcher_task = network_task.NetworkRequestTask(
-            [network.RequestToPerform(url=self.get_dataset_list_url(search_filters))],
-            self.network_requests_timeout,
-            self.auth_config,
-            description="Get dataset list",
+        self._dataset_list_request = Request(parent=self)
+        self._dataset_list_request.finished.connect(self.handle_dataset_list)
+        self._dataset_list_request.send(
+            RequestToPerform(url=self.get_dataset_list_url(search_filters)),
+            authcfg=self.auth_config,
+            timeout_ms=self.network_requests_timeout,
         )
-        self.network_fetcher_task.task_done.connect(self.handle_dataset_list)
-        qgis.core.QgsApplication.taskManager().addTask(self.network_fetcher_task)
 
-    def handle_dataset_list(self, result: bool):
-        """Handle the list of datasets returned by the remote
+    def handle_dataset_list(self, response: NetworkResponse):
+        """Handle the list of datasets returned by the remote.
 
-        This must emit the `dataset_list_received` signal.
+        Implementations must emit either ``dataset_list_received`` on success
+        or ``search_error_received`` on failure.
         """
         raise NotImplementedError
 
     def get_dataset_style(
         self, dataset: models.Dataset, emit_dataset_detail_received: bool = False
     ) -> None:
-        self.network_fetcher_task = network_task.NetworkRequestTask(
-            [network.RequestToPerform(QtCore.QUrl(dataset.default_style.sld_url))],
-            self.network_requests_timeout,
-            self.auth_config,
-            description="Get dataset style",
-        )
-        self.network_fetcher_task.task_done.connect(
+        self._style_request = Request(parent=self)
+        self._style_request.finished.connect(
             partial(
                 self.handle_dataset_style,
                 dataset,
                 emit_dataset_detail_received=emit_dataset_detail_received,
             )
         )
-        qgis.core.QgsApplication.taskManager().addTask(self.network_fetcher_task)
+        self._style_request.send(
+            RequestToPerform(url=QtCore.QUrl(dataset.default_style.sld_url)),
+            authcfg=self.auth_config,
+            timeout_ms=self.network_requests_timeout,
+        )
 
     def handle_dataset_style(
         self,
         dataset: models.Dataset,
-        task_result: bool,
-        emit_dataset_detail_received: typing.Optional[bool] = False,
+        response: NetworkResponse,
+        emit_dataset_detail_received: bool = False,
     ) -> None:
         raise NotImplementedError
 
@@ -126,49 +126,50 @@ class BaseGeonodeClient(QtCore.QObject):
         get_style_too: bool = False,
         authenticated: bool = False,
     ) -> None:
-
         auth_manager = qgis.core.QgsApplication.authManager()
         auth_provider_name = auth_manager.configAuthMethodKey(self.auth_config).lower()
-
         if auth_provider_name == "basic":
             authenticated = True
 
-        self.network_fetcher_task = network_task.NetworkRequestTask(
-            [network.RequestToPerform(url=self.get_dataset_detail_url(dataset.pk))],
-            self.network_requests_timeout,
-            self.auth_config,
-            description="Get dataset detail",
-        )
-        self.network_fetcher_task.task_done.connect(
+        self._dataset_detail_request = Request(parent=self)
+        self._dataset_detail_request.finished.connect(
             partial(
                 self.handle_dataset_detail,
                 get_style_too=get_style_too,
                 authenticated=authenticated,
             )
         )
-        qgis.core.QgsApplication.taskManager().addTask(self.network_fetcher_task)
+        self._dataset_detail_request.send(
+            RequestToPerform(url=self.get_dataset_detail_url(dataset.pk)),
+            authcfg=self.auth_config,
+            timeout_ms=self.network_requests_timeout,
+        )
 
-    def handle_dataset_detail(self, result: bool):
+    def handle_dataset_detail(
+        self,
+        response: NetworkResponse,
+        get_style_too: bool = False,
+        authenticated: bool = False,
+    ):
         """Handle dataset detail retrieval outcome.
 
-        This method should emit either `dataset_detail_received` or
-        `dataset_detail_error_received`.
-
+        Implementations must emit either ``dataset_detail_received`` or
+        ``dataset_detail_error_received``.
         """
-
         raise NotImplementedError
 
     def get_dataset_detail_from_id(self, dataset_id: int):
-        self.network_fetcher_task = network_task.NetworkRequestTask(
-            [network.RequestToPerform(url=self.get_dataset_detail_url(dataset_id))],
-            self.network_requests_timeout,
-            self.auth_config,
-            description="Get dataset detail",
+        self._dataset_detail_from_id_request = Request(parent=self)
+        self._dataset_detail_from_id_request.finished.connect(
+            self.handle_dataset_detail_from_id
         )
-        self.network_fetcher_task.task_done.connect(self.handle_dataset_detail_from_id)
-        qgis.core.QgsApplication.taskManager().addTask(self.network_fetcher_task)
+        self._dataset_detail_from_id_request.send(
+            RequestToPerform(url=self.get_dataset_detail_url(dataset_id)),
+            authcfg=self.auth_config,
+            timeout_ms=self.network_requests_timeout,
+        )
 
-    def handle_dataset_detail_from_id(self, task_result: bool):
+    def handle_dataset_detail_from_id(self, response: NetworkResponse):
         raise NotImplementedError
 
     def get_uploader_task(
@@ -179,11 +180,15 @@ class BaseGeonodeClient(QtCore.QObject):
     def upload_layer(
         self, layer: qgis.core.QgsMapLayer, allow_public_access: bool
     ) -> None:
-        self.network_fetcher_task = self.get_uploader_task(
+        self._upload_task = self.get_uploader_task(
             layer, allow_public_access, timeout=10 * 60 * 1000
         )  # the GeoNode GUI also uses a 10 minute timeout for uploads
-        self.network_fetcher_task.task_done.connect(self.handle_layer_upload)
-        qgis.core.QgsApplication.taskManager().addTask(self.network_fetcher_task)
+        self._upload_task.task_done.connect(self.handle_layer_upload)
+        # Re-emit the task's transition signal so the GUI can swap the
+        # "uploading" message for "processing on the server" without having
+        # to know about the QgsTask itself.
+        self._upload_task.upload_received.connect(self.dataset_upload_processing)
+        qgis.core.QgsApplication.taskManager().addTask(self._upload_task)
 
     def handle_layer_upload(self, result: bool):
         """Handle layer upload outcome.

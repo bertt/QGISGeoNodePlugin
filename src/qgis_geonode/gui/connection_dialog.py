@@ -13,11 +13,16 @@ from qgis.PyQt import (
 )
 from qgis.PyQt.uic import loadUiType
 
-from ..tasks import network_task
-from .. import apiclient, network, utils
+from .. import apiclient, utils
 from ..apiclient.base import BaseGeonodeClient
-from ..apiclient import is_api_client_supported
+from ..apiclient import (
+    ApiSupport,
+    api_client_support,
+    api_support_check,
+    is_api_client_supported,
+)
 from ..conf import ConnectionSettings, WfsVersion, settings_manager, plugin_metadata
+from ..httpclient import Request, NetworkResponse, RequestToPerform
 from ..utils import tr
 from packaging import version as packaging_version
 
@@ -44,26 +49,34 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
     detected_capabilities_lw: QtWidgets.QListWidget
 
     connection_id: uuid.UUID
-    discovery_task: typing.Optional[network_task.NetworkRequestTask]
+    discovery_task: typing.Optional[Request]
+    _test_connection_probe: typing.Optional[Request]
     geonode_client: BaseGeonodeClient = None
 
     def __init__(self, connection_settings: typing.Optional[ConnectionSettings] = None):
         super().__init__()
         self.setupUi(self)
+        # ``connection_pb`` and ``detect_wfs_version_pb`` are intentionally
+        # absent here — they get flipped to a "Cancel" affordance instead of
+        # disabled while their respective probes are in flight (see
+        # ``_set_button_to_cancel`` / ``_restore_button``).
         self._widgets_to_toggle_during_connection_test = [
-            self.connection_pb,
             self.buttonBox,
             self.authcfg_acs,
             self.options_gb,
             self.connection_details,
             self.detected_version_gb,
         ]
+        self._original_button_texts = {}
         self.bar = QgsMessageBar()
         self.bar.setSizePolicy(
-            QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Fixed
+            QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Fixed
         )
-        self.layout().insertWidget(0, self.bar, alignment=QtCore.Qt.AlignTop)
+        self.layout().insertWidget(
+            0, self.bar, alignment=QtCore.Qt.AlignmentFlag.AlignTop
+        )
         self.discovery_task = None
+        self._test_connection_probe = None
         self._populate_wfs_version_combobox()
         if connection_settings is not None:
             self.connection_id = connection_settings.id
@@ -77,12 +90,14 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
             self.wfs_version_cb.setCurrentIndex(wfs_version_index)
 
             self.detected_version_gb.setEnabled(False)
-            self.buttonBox.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(False)
+            self.buttonBox.button(
+                QtWidgets.QDialogButtonBox.StandardButton.Ok
+            ).setEnabled(False)
 
         else:
             self.connection_id = uuid.uuid4()
         self.update_connection_details()
-        # self.buttonBox.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(False)
+        # self.buttonBox.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setEnabled(False)
         ok_signals = [
             self.name_le.textChanged,
             self.url_le.textChanged,
@@ -91,14 +106,22 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
             signal.connect(self.update_ok_buttons)
         self.detect_wfs_version_pb.clicked.connect(self.detect_wfs_version)
         self.connection_pb.clicked.connect(self.test_connection)
+        self._original_button_texts = {
+            self.connection_pb: self.connection_pb.text(),
+            self.detect_wfs_version_pb: self.detect_wfs_version_pb.text(),
+        }
         # disallow names that have a slash since that is not compatible with how we
         # are storing plugin state in QgsSettings
         self.name_le.setValidator(
-            QtGui.QRegExpValidator(QtCore.QRegExp("[^\\/]+"), self.name_le)
+            QtGui.QRegularExpressionValidator(
+                QtCore.QRegularExpression("[^\\/]+"), self.name_le
+            )
         )
 
         # Plugin's docs open through the help button
-        self.buttonBox.button(QtWidgets.QDialogButtonBox.Help).clicked.connect(
+        self.buttonBox.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Help
+        ).clicked.connect(
             lambda: QtGui.QDesktopServices.openUrl(
                 QtCore.QUrl(plugin_metadata.get("homepage"))
             )
@@ -123,6 +146,40 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
         v_1_1_0_index = self.wfs_version_cb.findData(WfsVersion.V_1_1_0)
         self.wfs_version_cb.setCurrentIndex(v_1_1_0_index)
 
+    def _set_button_to_cancel(
+        self,
+        button: QtWidgets.QAbstractButton,
+        cancel_callback: typing.Callable[[], None],
+    ) -> None:
+        """Flip *button* into a cancel affordance for the duration of a probe.
+
+        Disconnects the original click handler, rebinds the click to the
+        provided cancel callable, and re-labels the button to ``Cancel``.
+        Pair every call with :meth:`_restore_button` from the matching
+        completion handler.
+        """
+        try:
+            button.clicked.disconnect()
+        except TypeError:
+            pass
+        button.clicked.connect(cancel_callback)
+        button.setText(tr("Cancel"))
+        button.setEnabled(True)
+
+    def _restore_button(
+        self,
+        button: QtWidgets.QAbstractButton,
+        original_handler: typing.Callable[[], None],
+    ) -> None:
+        try:
+            button.clicked.disconnect()
+        except TypeError:
+            pass
+        button.clicked.connect(original_handler)
+        original_text = self._original_button_texts.get(button)
+        if original_text is not None:
+            button.setText(original_text)
+
     def detect_wfs_version(self):
         for widget in self._widgets_to_toggle_during_connection_test:
             widget.setEnabled(False)
@@ -132,17 +189,22 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
         query.addQueryItem("request", "GetCapabilities")
         url = QtCore.QUrl(f"{current_settings.base_url}/gs/ows")
         url.setQuery(query)
-        self.discovery_task = network_task.NetworkRequestTask(
-            [network.RequestToPerform(url)],
-            network_task_timeout=current_settings.network_requests_timeout,
-            authcfg=current_settings.auth_config,
-            description="Detect WFS version",
-        )
-        self.discovery_task.task_done.connect(self.handle_wfs_version_detection_test)
+        self.discovery_task = Request(parent=self)
+        self.discovery_task.finished.connect(self.handle_wfs_version_detection_test)
         utils.show_message(
-            self.bar, tr("Detecting WFS version..."), add_loading_widget=True
+            self.bar,
+            tr("Detecting WFS version..."),
+            add_loading_widget=True,
+            cancel_callback=self.discovery_task.cancel,
         )
-        qgis.core.QgsApplication.taskManager().addTask(self.discovery_task)
+        self._set_button_to_cancel(
+            self.detect_wfs_version_pb, self.discovery_task.cancel
+        )
+        self.discovery_task.send(
+            RequestToPerform(url=url),
+            authcfg=current_settings.auth_config,
+            timeout_ms=current_settings.network_requests_timeout,
+        )
 
     def get_connection_settings(self) -> ConnectionSettings:
         return ConnectionSettings(
@@ -159,18 +221,40 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
             widget.setEnabled(False)
 
         current_settings = self.get_connection_settings()
+        self._test_connection_probe = apiclient.probe_api_client(
+            current_settings.base_url,
+            auth_config=current_settings.auth_config,
+            timeout_ms=current_settings.network_requests_timeout,
+            parent=self,
+        )
+        utils.show_message(
+            self.bar,
+            tr("Testing connection..."),
+            add_loading_widget=True,
+            cancel_callback=self._test_connection_probe.cancel,
+        )
+        self._set_button_to_cancel(
+            self.connection_pb, self._test_connection_probe.cancel
+        )
+        # probe_api_client populates the cache from its own finished slot
+        # before this one runs, so api_client_support reflects the probe
+        # outcome.
+        self._test_connection_probe.finished.connect(
+            lambda _response, url=current_settings.base_url: self.handle_discovery_test(
+                api_client_support(url)
+            )
+        )
 
-        # Replace old version.txt request with /api/v2/ check
-        success = is_api_client_supported(current_settings.base_url)
-
-        self.handle_discovery_test(success)
-
-    def handle_discovery_test(self, is_supported: bool):
+    def handle_discovery_test(self, support: ApiSupport):
+        self._restore_button(self.connection_pb, self.test_connection)
         self.enable_post_test_connection_buttons()
 
-        if is_supported:
+        if support is ApiSupport.SUPPORTED:
             message = "Connection is valid"
             level = qgis.core.Qgis.Info
+        elif support is ApiSupport.UNSUPPORTED:
+            message = api_support_check().unsupported_message()
+            level = qgis.core.Qgis.Critical
         else:
             message = "This GeoNode instance does not support the API client."
             level = qgis.core.Qgis.Critical
@@ -178,7 +262,8 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
         utils.show_message(self.bar, message, level)
         self.update_connection_details()
 
-    def handle_wfs_version_detection_test(self, task_result: bool):
+    def handle_wfs_version_detection_test(self, response: NetworkResponse):
+        self._restore_button(self.detect_wfs_version_pb, self.detect_wfs_version)
         self.enable_post_test_connection_buttons()
         # TODO: set the default to WfsVersion.AUTO when this QGIS issue has been resolved:
         #
@@ -186,22 +271,20 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
         #
         default_version = WfsVersion.V_1_1_0
         version = default_version
-        if task_result:
-            response_contents = self.discovery_task.response_contents[0]
-            if response_contents is not None and response_contents.qt_error is None:
-                raw_response = response_contents.response_body
-                detected_versions = _get_wfs_declared_versions(raw_response)
-                preference_order = [
-                    "1.1.0",
-                    "2.0.0",
-                    "1.0.0",
-                ]
-                for preference in preference_order:
-                    if preference in detected_versions:
-                        version = WfsVersion(preference)
-                        break
-                else:
-                    version = default_version
+        if response.ok:
+            raw_response = QtCore.QByteArray(response.body)
+            detected_versions = _get_wfs_declared_versions(raw_response)
+            preference_order = [
+                "1.1.0",
+                "2.0.0",
+                "1.0.0",
+            ]
+            for preference in preference_order:
+                if preference in detected_versions:
+                    version = WfsVersion(preference)
+                    break
+            else:
+                version = default_version
             self.bar.clearWidgets()
         else:
             utils.show_message(
@@ -222,7 +305,9 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
         if api_supported:
             # Enable the detected_version group box and OK button
             self.detected_version_gb.setEnabled(True)
-            self.buttonBox.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(True)
+            self.buttonBox.button(
+                QtWidgets.QDialogButtonBox.StandardButton.Ok
+            ).setEnabled(True)
 
             current_settings = self.get_connection_settings()
             client: BaseGeonodeClient = apiclient.get_geonode_client(current_settings)
@@ -236,7 +321,9 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
             )
         else:
             self.detected_version_gb.setEnabled(False)
-            self.buttonBox.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(False)
+            self.buttonBox.button(
+                QtWidgets.QDialogButtonBox.StandardButton.Ok
+            ).setEnabled(False)
 
     def enable_post_test_connection_buttons(self):
         for widget in self._widgets_to_toggle_during_connection_test:
@@ -249,7 +336,7 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
     def accept(self):
         connection_settings = self.get_connection_settings()
         name_pattern = re.compile(
-            f"^{connection_settings.name}$|^{connection_settings.name}(\(\d+\))$"
+            rf"^{connection_settings.name}$|^{connection_settings.name}(\(\d+\))$"
         )
         duplicate_names = []
         for connection_conf in settings_manager.list_connections():
@@ -272,7 +359,9 @@ class ConnectionDialog(QtWidgets.QDialog, DialogUi):
         enabled_state = self.name_le.text() != "" and self.url_le.text() != ""
         self.connection_pb.setEnabled(enabled_state)
         if url_status != True:
-            self.buttonBox.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(False)
+            self.buttonBox.button(
+                QtWidgets.QDialogButtonBox.StandardButton.Ok
+            ).setEnabled(False)
             self.connection_pb.setEnabled(False)
             message = "Please insert only the domain of a valid GeoNode URL"
             level = qgis.core.Qgis.Info

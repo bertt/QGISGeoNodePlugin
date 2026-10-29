@@ -6,13 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.2.0-alpha] - 2026-10-29
 
+
+### Added
+- Introduced support for QGIS 4
 ### Changed
-- Alpha pre-release
+- Refactoring of the transport and the GeoNode client api code
 
 ## [2.1.0] - 2025-11-28
 
-### Fixed
+### Added
 - Introduced support for GeoNode 5
+### Fixed
 - Fixes a bug in the NetworkRequesttask method which handles the timeout events
 
 ## [2.0.0] - 2024-12-10

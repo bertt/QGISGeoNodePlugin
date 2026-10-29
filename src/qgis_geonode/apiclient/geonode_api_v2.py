@@ -12,6 +12,13 @@ from qgis.PyQt import (
 
 from .. import network
 from .. import styles as geonode_styles
+from ..httpclient import (
+    ErrorKind,
+    NetworkError,
+    NetworkResponse,
+    Request,
+    RequestToPerform,
+)
 from ..utils import log, url_from_geoserver
 from ..tasks import tasks
 
@@ -58,10 +65,20 @@ class GeoNodeApiClient(BaseGeonodeClient):
     def get_ordering_fields(self) -> typing.List[typing.Tuple[str, str]]:
         return [
             ("title", "Title"),
+            ("created", "Created"),
         ]
 
     def get_dataset_upload_url(self) -> QtCore.QUrl:
         return QtCore.QUrl(f"{self.api_url}/uploads/upload/")
+
+    def get_execution_request_url_template(self) -> str:
+        # NOTE: no trailing slash — the GeoNode router serves the detail at
+        # ``/executionrequest/{id}`` and a request to ``/{id}/`` returns a 3xx
+        # redirect that Qt does not follow, leaving the response with
+        # ``http_status=301/302`` and no error → ``handle_layer_upload`` falls
+        # through to its generic "Could not upload layer to GeoNode" branch
+        # even though the upload itself was fine.
+        return f"{self.api_url}/executionrequest/{{execution_id}}"
 
     def build_search_query(
         self, search_filters: models.GeonodeApiSearchFilters
@@ -85,22 +102,30 @@ class GeoNodeApiClient(BaseGeonodeClient):
         if search_filters.temporal_extent_start is not None:
             query.addQueryItem(
                 "filter{temporal_extent_start.gte}",
-                search_filters.temporal_extent_start.toString(QtCore.Qt.ISODate),
+                search_filters.temporal_extent_start.toString(
+                    QtCore.Qt.DateFormat.ISODate
+                ),
             )
         if search_filters.temporal_extent_end is not None:
             query.addQueryItem(
                 "filter{temporal_extent_end.lte}",
-                search_filters.temporal_extent_end.toString(QtCore.Qt.ISODate),
+                search_filters.temporal_extent_end.toString(
+                    QtCore.Qt.DateFormat.ISODate
+                ),
             )
         if search_filters.publication_date_start is not None:
             query.addQueryItem(
                 "filter{date.gte}",
-                search_filters.publication_date_start.toString(QtCore.Qt.ISODate),
+                search_filters.publication_date_start.toString(
+                    QtCore.Qt.DateFormat.ISODate
+                ),
             )
         if search_filters.publication_date_end is not None:
             query.addQueryItem(
                 "filter{date.lte}",
-                search_filters.publication_date_end.toString(QtCore.Qt.ISODate),
+                search_filters.publication_date_end.toString(
+                    QtCore.Qt.DateFormat.ISODate
+                ),
             )
         # TODO revisit once the support for spatial extent is available on
         # GeoNode API V2
@@ -123,28 +148,28 @@ class GeoNodeApiClient(BaseGeonodeClient):
         if is_raster:
             query.addQueryItem("filter{subtype.in}", "raster")
         if search_filters.ordering_field is not None:
-            query.addQueryItem(
-                "sort[]", f"{'-' if search_filters.reverse_ordering else ''}name"
-            )
+            prefix = "-" if search_filters.reverse_ordering else ""
+            query.addQueryItem("sort[]", f"{prefix}{search_filters.ordering_field}")
         return query
 
-    def handle_dataset_detail_from_id(self, task_result: bool) -> None:
-        deserialized_resource = self._retrieve_response(
-            task_result, 0, self.dataset_detail_error_received
+    def handle_dataset_detail_from_id(self, response: NetworkResponse) -> None:
+        deserialized_resource = self._parse_json_response(
+            response, self.dataset_detail_error_received
         )
-        if deserialized_resource is not None:
-            try:
-                dataset = self._parse_dataset_detail(deserialized_resource["dataset"])
-            except KeyError as exc:
-                log(
-                    f"Could not parse server response into a dataset: {str(exc)}",
-                    debug=False,
-                )
-            else:
-                if dataset.dataset_sub_type == models.GeonodeResourceType.VECTOR_LAYER:
-                    self.get_dataset_style(dataset, emit_dataset_detail_received=True)
-                else:
-                    self.dataset_detail_received.emit(dataset)
+        if deserialized_resource is None:
+            return
+        try:
+            dataset = self._parse_dataset_detail(deserialized_resource["dataset"])
+        except KeyError as exc:
+            log(
+                f"Could not parse server response into a dataset: {str(exc)}",
+                debug=False,
+            )
+            return
+        if dataset.dataset_sub_type == models.GeonodeResourceType.VECTOR_LAYER:
+            self.get_dataset_style(dataset, emit_dataset_detail_received=True)
+        else:
+            self.dataset_detail_received.emit(dataset)
 
     def get_uploader_task(
         self, layer: qgis.core.QgsMapLayer, allow_public_access: bool, timeout: int
@@ -156,26 +181,29 @@ class GeoNodeApiClient(BaseGeonodeClient):
             self.auth_config,
             network_task_timeout=timeout,
             description="Upload layer to GeoNode",
+            execution_request_url_template=self.get_execution_request_url_template(),
         )
 
     def handle_layer_upload(self, result: bool):
-        success_statuses = (
-            200,
-            201,
-        )
-        if result:
-            response_contents = self.network_fetcher_task.response_contents[0]
-            if response_contents.http_status_code in success_statuses:
-                self.dataset_uploaded.emit()
-            else:
-                self.dataset_upload_error_received[str, int, str].emit(
-                    response_contents.qt_error,
-                    response_contents.http_status_code,
-                    response_contents.http_status_reason,
-                )
+        success_statuses = (200, 201)
+        response = self._upload_task.response
+        if (
+            result
+            and response is not None
+            and response.ok
+            and response.http_status in success_statuses
+        ):
+            self.dataset_uploaded.emit()
+            return
+        if response is not None and response.error is not None:
+            self.dataset_upload_error_received.emit(response.error)
         else:
-            self.dataset_upload_error_received[str].emit(
-                "Could not upload layer to GeoNode"
+            self.dataset_upload_error_received.emit(
+                NetworkError(
+                    kind=ErrorKind.TRANSPORT,
+                    url=self.get_dataset_upload_url().toString(),
+                    message="Could not upload layer to GeoNode",
+                )
             )
 
     def _get_service_urls(
@@ -215,124 +243,117 @@ class GeoNodeApiClient(BaseGeonodeClient):
     def get_dataset_detail_url(self, dataset_id: int) -> QtCore.QUrl:
         return QtCore.QUrl(f"{self.dataset_list_url}{dataset_id}/")
 
-    def handle_dataset_list(self, task_result: bool) -> None:
-        deserialized_content = self._retrieve_response(
-            task_result, 0, self.search_error_received
+    def handle_dataset_list(self, response: NetworkResponse) -> None:
+        deserialized_content = self._parse_json_response(
+            response, self.search_error_received
         )
-        if deserialized_content is not None:
-            brief_datasets = []
-            for raw_brief_ds in deserialized_content.get(self._DATASET_NAME_PLURAL, []):
-                try:
-                    parsed_properties = self._get_common_model_properties(raw_brief_ds)
-                    brief_dataset = models.BriefDataset(**parsed_properties)
-                except ValueError as exc:
-                    log(
-                        f"Could not parse {raw_brief_ds!r} into a valid item: {str(exc)}",
-                        debug=False,
-                    )
-                else:
-                    brief_datasets.append(brief_dataset)
-            pagination_info = models.GeonodePaginationInfo(
-                total_records=deserialized_content.get("total") or 0,
-                current_page=deserialized_content.get("page") or 1,
-                page_size=deserialized_content.get("page_size") or 0,
-            )
-            self.dataset_list_received.emit(brief_datasets, pagination_info)
+        if deserialized_content is None:
+            return
+        brief_datasets = []
+        for raw_brief_ds in deserialized_content.get(self._DATASET_NAME_PLURAL, []):
+            try:
+                parsed_properties = self._get_common_model_properties(raw_brief_ds)
+                brief_dataset = models.BriefDataset(**parsed_properties)
+            except ValueError as exc:
+                log(
+                    f"Could not parse {raw_brief_ds!r} into a valid item: {str(exc)}",
+                    debug=False,
+                )
+            else:
+                brief_datasets.append(brief_dataset)
+        pagination_info = models.GeonodePaginationInfo(
+            total_records=deserialized_content.get("total") or 0,
+            current_page=deserialized_content.get("page") or 1,
+            page_size=deserialized_content.get("page_size") or 0,
+        )
+        self.dataset_list_received.emit(brief_datasets, pagination_info)
 
     def handle_dataset_detail(
         self,
-        task_result: bool,
+        response: NetworkResponse,
         get_style_too: bool = False,
         authenticated: bool = False,
     ) -> None:
         log("inside the API client's handle_dataset_detail")
-        deserialized_resource = self._retrieve_response(
-            task_result, 0, self.dataset_detail_error_received
+        deserialized_resource = self._parse_json_response(
+            response, self.dataset_detail_error_received
         )
-        if deserialized_resource is not None:
-            try:
-                dataset = self._parse_dataset_detail(
-                    deserialized_resource[self._DATASET_NAME]
-                )
-            except KeyError as exc:
-                log(
-                    f"Could not parse server response into a dataset: {str(exc)}",
-                    debug=False,
-                )
-            else:
-                # check if the request is from a WFS to see if it will retrieve the style
-                if get_style_too and authenticated:
-                    is_vector = (
-                        dataset.dataset_sub_type
-                        == models.GeonodeResourceType.VECTOR_LAYER
-                    )
-                    should_load_vector_style = (
-                        models.ApiClientCapability.LOAD_VECTOR_LAYER_STYLE
-                        in self.capabilities
-                    )
-                    # Check if the layer is vector and if it has the permissions to read the style
-                    if is_vector and should_load_vector_style:
-                        self.get_dataset_style(
-                            dataset, emit_dataset_detail_received=True
-                        )
-                else:
-                    self.dataset_detail_received.emit(dataset)
+        if deserialized_resource is None:
+            return
+        try:
+            dataset = self._parse_dataset_detail(
+                deserialized_resource[self._DATASET_NAME]
+            )
+        except KeyError as exc:
+            log(
+                f"Could not parse server response into a dataset: {str(exc)}",
+                debug=False,
+            )
+            return
+        # check if the request is from a WFS to see if it will retrieve the style
+        if get_style_too and authenticated:
+            is_vector = (
+                dataset.dataset_sub_type == models.GeonodeResourceType.VECTOR_LAYER
+            )
+            should_load_vector_style = (
+                models.ApiClientCapability.LOAD_VECTOR_LAYER_STYLE in self.capabilities
+            )
+            # Check if the layer is vector and if it has the permissions to read the style
+            if is_vector and should_load_vector_style:
+                self.get_dataset_style(dataset, emit_dataset_detail_received=True)
+        else:
+            self.dataset_detail_received.emit(dataset)
 
     def handle_dataset_style(
         self,
         dataset: models.Dataset,
-        task_result: bool,
+        response: NetworkResponse,
         emit_dataset_detail_received: bool = False,
     ) -> None:
-        response_contents = self._retrieve_response(
-            task_result, 0, self.style_detail_error_received, deserialize_as_json=False
+        if not response.ok:
+            self.style_detail_error_received.emit(response.error)
+            return
+        sld_named_layer, error_message = geonode_styles.deserialize_sld_doc(
+            QtCore.QByteArray(response.body)
         )
-        if response_contents is not None:
-            sld_named_layer, error_message = geonode_styles.get_usable_sld(
-                response_contents
+        if sld_named_layer is None:
+            self.style_detail_error_received.emit(
+                NetworkError(
+                    kind=ErrorKind.TRANSPORT,
+                    url=response.request.url.toString(),
+                    message=f"Could not parse downloaded SLD: {error_message}",
+                    http_status=response.http_status,
+                )
             )
-            if sld_named_layer is None:
-                self.style_detail_error_received[str].emit(
-                    f"Could not parse downloaded SLD: {error_message}"
-                )
-            dataset.default_style.sld = sld_named_layer
-            if emit_dataset_detail_received:
-                self.dataset_detail_received.emit(dataset)
+            return
+        dataset.default_style.sld = sld_named_layer
+        if emit_dataset_detail_received:
+            self.dataset_detail_received.emit(dataset)
 
-    def _retrieve_response(
+    def _parse_json_response(
         self,
-        task_result: bool,
-        contents_index: int,
+        response: NetworkResponse,
         error_signal,
-        deserialize_as_json: typing.Optional[bool] = True,
-    ) -> typing.Optional[typing.Union[typing.Dict, network.ParsedNetworkReply]]:
-        """Internal method that takes care of boilerplate-ish response parsing."""
-        result = None
-        if task_result:
-            response_content = self.network_fetcher_task.response_contents[
-                contents_index
-            ]
-            if response_content.qt_error is None:
-                result = response_content
-                if deserialize_as_json:
-                    deserialized = network.deserialize_json_response(
-                        response_content.response_body
-                    )
-                    if deserialized is not None:
-                        result = deserialized
-                    else:
-                        error_signal[str].emit(
-                            "Could not parse response from remote GeoNode"
-                        )
-            else:
-                error_signal[str, int, str].emit(
-                    response_content.qt_error,
-                    response_content.http_status_code,
-                    response_content.http_status_reason,
+    ) -> typing.Optional[typing.Union[typing.Dict, typing.List]]:
+        """Emit ``error_signal`` (a ``pyqtSignal(NetworkError)``) on failure;
+        return deserialized JSON on success."""
+        if not response.ok:
+            error_signal.emit(response.error)
+            return None
+        deserialized = network.deserialize_json_response(
+            QtCore.QByteArray(response.body)
+        )
+        if deserialized is None:
+            error_signal.emit(
+                NetworkError(
+                    kind=ErrorKind.TRANSPORT,
+                    url=response.request.url.toString(),
+                    message="Could not parse response from remote GeoNode",
+                    http_status=response.http_status,
                 )
-        else:
-            error_signal[str].emit("Could not complete network request")
-        return result
+            )
+            return None
+        return deserialized
 
     def _get_sld_url(self, raw_style: typing.Dict) -> typing.Optional[str]:
         auth_manager = qgis.core.QgsApplication.authManager()
